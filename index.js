@@ -426,7 +426,7 @@ async function checkAndPost() {
   }
 
   const now = new Date();
-  const lastCheckedStr = discordTimestamp(now, "R"); // relative time
+  const lastCheckedStr = discordTimestamp(now, "F"); // relative time
 
 
   try {
