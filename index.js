@@ -286,8 +286,9 @@ async function fetchSprintRed() {
   };
 }
 
-function formatLocalTime(d) {
-  return d.toLocaleString();
+function discordTimestamp(date, style = "F") {
+  const unix = Math.floor(date.getTime() / 1000);
+  return `<t:${unix}:${style}>`;
 }
 
 async function upsertMessage(channel, payload, messageId) {
@@ -387,7 +388,7 @@ async function renderAndPostToMainMessage(channel, club50, yellow, red, lastChec
   const dataHash = sha1(JSON.stringify({ club50, yellow, red }));
 
   const lastUpdatedStr =
-    config.lastHash === dataHash ? (config.lastUpdated || lastCheckedStr) : lastCheckedStr;
+    config.lastHash === dataHash ? (config.lastUpdated || lastCheckedStr) : discordTimestamp(now, "F");
 
   config.lastHash = dataHash;
   config.lastUpdated = lastUpdatedStr;
@@ -425,7 +426,8 @@ async function checkAndPost() {
   }
 
   const now = new Date();
-  const lastCheckedStr = formatLocalTime(now);
+  const lastCheckedStr = discordTimestamp(now, "R"); // relative time
+
 
   try {
     const club50 = await fetchClub50();
@@ -443,7 +445,7 @@ async function checkAndPost() {
     // Always keep runtime cache fresh so buttons work
     const lastUpdatedStrForCache = unchanged
       ? (config.lastUpdated || lastCheckedStr)
-      : lastCheckedStr;
+      : discordTimestamp(now, "F");
 
     latest = {
       club50,
@@ -499,7 +501,7 @@ async function checkAndPost() {
 
     const lastUpdatedStr = unchanged
       ? (config.lastUpdated || lastCheckedStr) // unchanged but missing message → preserve lastUpdated
-      : lastCheckedStr;
+      : discordTimestamp(now, "F");
 
     const content =
       `**[${titleLink}](${linkUrl})**\n` +
