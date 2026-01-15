@@ -10,6 +10,16 @@
 // - Class render posts as a new channel message and deletes after 5 minutes
 // - If interaction fails, ephemeral error is auto-deleted after 10 seconds
 // - Slash command: /refresh (forces immediate scrape+render)
+//
+// Fixes included:
+// ✅ lastUpdated vs lastChecked treated separately
+//    - lastUpdated: only changes when website scrape data changes (hash differs)
+//    - lastChecked: updates every cron check (and manual /refresh check time)
+// ✅ both timestamps always displayed as Discord user-local time (<t:...:F>)
+// ✅ fix bug: render/update logic referenced `now` without defining it
+// ✅ cleanup: remove unused/duplicated timestamp logic paths; single update pipeline
+
+"use strict";
 
 // ------------------ imports ------------------
 const fs = require("fs");
@@ -78,13 +88,16 @@ function sha1(s) {
 }
 
 function logPath(msg) {
-  if (DEBUG_OOR) {
-    console.log(`CHECK_AND_POST → ${msg}`);
-  }
+  if (DEBUG_OOR) console.log(`CHECK_AND_POST → ${msg}`);
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function discordTimestamp(date, style = "F") {
+  const unix = Math.floor(date.getTime() / 1000);
+  return `<t:${unix}:${style}>`;
 }
 
 async function fetchHtmlWithRetry(url, attempts = 3) {
@@ -286,25 +299,6 @@ async function fetchSprintRed() {
   };
 }
 
-function discordTimestamp(date, style = "F") {
-  const unix = Math.floor(date.getTime() / 1000);
-  return `<t:${unix}:${style}>`;
-}
-
-async function upsertMessage(channel, payload, messageId) {
-  if (messageId) {
-    try {
-      const existing = await channel.messages.fetch(messageId);
-      await existing.edit(payload);
-      return existing.id;
-    } catch {
-      // deleted/unknown -> send new
-    }
-  }
-  const sent = await channel.send(payload);
-  return sent.id;
-}
-
 // ---- Buttons ----
 function buildButtonsRow() {
   const yellowBtn = new ButtonBuilder()
@@ -383,40 +377,105 @@ async function scrapeAll() {
   return { club50, yellow, red };
 }
 
-async function renderAndPostToMainMessage(channel, club50, yellow, red, lastCheckedStr) {
-  const png = await renderTripleStandingsPng(club50, yellow, red);
-  const dataHash = sha1(JSON.stringify({ club50, yellow, red }));
-
-  const lastUpdatedStr =
-    config.lastHash === dataHash ? (config.lastUpdated || lastCheckedStr) : discordTimestamp(now, "F");
-
-  config.lastHash = dataHash;
-  config.lastUpdated = lastUpdatedStr;
-  config.lastChecked = lastCheckedStr;
-
-  latest = { club50, yellow, red, lastCheckedStr, lastUpdatedStr, lastHash: dataHash };
-
-  const attachment = new AttachmentBuilder(png, { name: "standings.png" });
-
+function buildContent(lastUpdatedStr, lastCheckedStr) {
   const linkUrl = "https://results.octaneonlineracing.com/";
-  const titleLink = `OCTANE ONLINE RACING STANDINGS - Click here for Full OOR Results Pages`;
+  const titleLink = "OCTANE ONLINE RACING STANDINGS - Click here for Full OOR Results Pages";
 
-  const content =
+  return (
     `**[${titleLink}](${linkUrl})**\n` +
     `Last updated: **${lastUpdatedStr}**\n` +
-    `Last checked: **${lastCheckedStr}**`;
+    `Last checked: **${lastCheckedStr}**`
+  );
+}
 
-  const payload = {
+/**
+ * Update the Discord message in-place when possible.
+ * - lastUpdated changes ONLY if dataHash changed
+ * - lastChecked changes EVERY run (cron or /refresh)
+ * - Render PNG ONLY when data changed OR message is missing.
+ */
+async function applyUpdate(channel, club50, yellow, red, nowDate) {
+  const lastCheckedStr = discordTimestamp(nowDate, "F");
+  const dataHash = sha1(JSON.stringify({ club50, yellow, red }));
+  const unchanged = !!(config.lastHash && config.lastHash === dataHash);
+
+  // lastUpdated: preserve on unchanged; set to "now" only when changed
+  const lastUpdatedStr = unchanged
+    ? (config.lastUpdated || lastCheckedStr)
+    : discordTimestamp(nowDate, "F");
+
+  // keep runtime cache fresh for buttons
+  latest = {
+    club50,
+    yellow,
+    red,
+    lastCheckedStr,
+    lastUpdatedStr,
+    lastHash: dataHash,
+  };
+
+  // Try fetch existing message (if we have an ID)
+  let existing = null;
+  if (config.messageId) {
+    try {
+      existing = await channel.messages.fetch(config.messageId);
+    } catch {
+      existing = null;
+    }
+  }
+
+  const content = buildContent(lastUpdatedStr, lastCheckedStr);
+
+  // If message exists:
+  // - unchanged: edit only content/components (keep old image attachment)
+  // - changed: render and edit with new image
+  if (existing) {
+    if (unchanged) {
+      logPath("UNCHANGED + message exists → edit content/components only");
+      await existing.edit({
+        content,
+        components: [buildButtonsRow()],
+      });
+    } else {
+      logPath("CHANGED + message exists → re-render and edit with new image");
+      const png = await renderTripleStandingsPng(club50, yellow, red);
+      const attachment = new AttachmentBuilder(png, { name: "standings.png" });
+
+      await existing.edit({
+        content,
+        files: [attachment],
+        components: [buildButtonsRow()],
+      });
+    }
+
+    // Persist state
+    config.lastChecked = lastCheckedStr;
+    if (!unchanged) config.lastUpdated = lastUpdatedStr;
+    config.lastHash = dataHash;
+    saveConfig();
+
+    return { unchanged, dataHash, lastUpdatedStr, lastCheckedStr };
+  }
+
+  // If message missing: must render and send a new message (even if unchanged)
+  logPath(unchanged ? "UNCHANGED but message missing → render+send new" : "CHANGED + message missing → render+send new");
+  const png = await renderTripleStandingsPng(club50, yellow, red);
+  const attachment = new AttachmentBuilder(png, { name: "standings.png" });
+
+  const sent = await channel.send({
     content,
     files: [attachment],
     components: [buildButtonsRow()],
-  };
+  });
 
-  const newMessageId = await upsertMessage(channel, payload, config.messageId || "");
-  config.messageId = newMessageId;
-
+  config.messageId = sent.id;
+  config.lastChecked = lastCheckedStr;
+  if (!unchanged) config.lastUpdated = lastUpdatedStr; // only bump on changed
+  else config.lastUpdated = config.lastUpdated || lastUpdatedStr; // ensure set if first ever run
+  config.lastHash = dataHash;
   saveConfig();
-  return { lastUpdatedStr, dataHash };
+
+  return { unchanged, dataHash, lastUpdatedStr, lastCheckedStr };
 }
 
 async function checkAndPost() {
@@ -425,125 +484,19 @@ async function checkAndPost() {
     throw new Error("Configured channelId is not a text channel");
   }
 
-  const now = new Date();
-  const lastCheckedStr = discordTimestamp(now, "F"); // relative time
-
+  const nowDate = new Date();
 
   try {
-    const club50 = await fetchClub50();
-    const yellow = await fetchSprintYellow();
-    const red = await fetchSprintRed();
-
-    const dataHash = sha1(JSON.stringify({ club50, yellow, red }));
-    const unchanged = !!(config.lastHash && config.lastHash === dataHash);
-
-    logPath(unchanged ? "DATA UNCHANGED (hash match)" : "DATA CHANGED (hash differs)");
-
-    const titleLink = `OCTANE ONLINE RACING STANDINGS - Click here for Full OOR Results Pages`;
-    const linkUrl = "https://results.octaneonlineracing.com/";
-
-    // Always keep runtime cache fresh so buttons work
-    const lastUpdatedStrForCache = unchanged
-      ? (config.lastUpdated || lastCheckedStr)
-      : discordTimestamp(now, "F");
-
-    latest = {
-      club50,
-      yellow,
-      red,
-      lastCheckedStr,
-      lastUpdatedStr: lastUpdatedStrForCache,
-      lastHash: dataHash,
-    };
-
-    // ---------- UNCHANGED PATH: try edit existing message ----------
-    if (unchanged && config.messageId) {
-      logPath(`UNCHANGED + messageId present (${config.messageId}) → attempting edit`);
-
-      const content =
-        `**[${titleLink}](${linkUrl})**\n` +
-        `Last updated: **${config.lastUpdated || lastCheckedStr}**\n` +
-        `Last checked: **${lastCheckedStr}**`;
-
-      try {
-        const existing = await channel.messages.fetch(config.messageId);
-        await existing.edit({
-          content,
-          components: [buildButtonsRow()],
-        });
-
-        logPath("UNCHANGED + edit SUCCESS → updated last checked only");
-
-        config.lastChecked = lastCheckedStr;
-        saveConfig();
-
-        if (DEBUG_OOR) console.log("No change; updated last checked only.");
-        return; // ✅ only return if edit succeeded
-      } catch (e) {
-        // Message missing/unknown -> fall through and post new
-        logPath("UNCHANGED but message MISSING → will POST NEW message");
-        console.warn("Existing message missing, will post new.");
-        // do NOT wipe messageId yet; keep it for optional delete attempts
-      }
-    }
-
-    // ---------- POST NEW MESSAGE PATH (changed OR message missing) ----------
-    logPath(
-      unchanged
-        ? "POSTING NEW message (message missing but data unchanged)"
-        : "POSTING NEW message (data changed)"
-    );
-
-    const oldMessageId = config.messageId || ""; // keep for deletion attempt
-
-    const png = await renderTripleStandingsPng(club50, yellow, red);
-    const attachment = new AttachmentBuilder(png, { name: "standings.png" });
-
-    const lastUpdatedStr = unchanged
-      ? (config.lastUpdated || lastCheckedStr) // unchanged but missing message → preserve lastUpdated
-      : discordTimestamp(now, "F");
-
-    const content =
-      `**[${titleLink}](${linkUrl})**\n` +
-      `Last updated: **${lastUpdatedStr}**\n` +
-      `Last checked: **${lastCheckedStr}**`;
-
-    const sent = await channel.send({
-      content,
-      files: [attachment],
-      components: [buildButtonsRow()],
-    });
-
-    logPath(`NEW message posted → id=${sent.id}`);
-
-    // If CHANGED: try delete old message to avoid duplicates
-    if (!unchanged && oldMessageId) {
-      try {
-        const old = await channel.messages.fetch(oldMessageId);
-        await old.delete();
-        logPath(`Deleted old message → id=${oldMessageId}`);
-      } catch (e) {
-        console.warn("Could not delete old message:", e?.message || e);
-      }
-    }
-
-    config.messageId = sent.id;
-    config.lastHash = dataHash;
-    config.lastUpdated = lastUpdatedStr;
-    config.lastChecked = lastCheckedStr;
-    saveConfig();
-
-    if (DEBUG_OOR) {
-      console.log(
-        unchanged
-          ? "Message missing but no data change; posted new message to restore it."
-          : "Changed; posted new message and updated tracking."
-      );
-    }
+    const { club50, yellow, red } = await scrapeAll();
+    const result = await applyUpdate(channel, club50, yellow, red, nowDate);
+    logPath(result.unchanged ? "DONE (unchanged)" : "DONE (changed)");
   } catch (e) {
+    // still record the check time so you can see "we tried"
+    try {
+      config.lastChecked = discordTimestamp(nowDate, "F");
+      saveConfig();
+    } catch {}
     console.error("checkAndPost blocked (keeping existing Discord message):", e?.message || e);
-    config.lastChecked = lastCheckedStr;
-    saveConfig();
   }
 }
 
@@ -573,10 +526,11 @@ async function handleClassButton(interaction, which) {
   const data = which === "yellow" ? latest.yellow : which === "red" ? latest.red : null;
   if (!data) throw new Error("No cached standings yet — wait for the next scrape.");
 
-  const splitLabel = which === "yellow" ? "Split Yellow Sprint Standings" : "Split Red Sprint Standings";
+  const splitLabel =
+    which === "yellow" ? "Split Yellow Sprint Standings" : "Split Red Sprint Standings";
+
   const panels = buildClassPanels(data, splitLabel);
   const png = await renderClassGridPng(panels);
-
   const attachment = new AttachmentBuilder(png, { name: `class-${which}.png` });
 
   const posted = await channel.send({
@@ -596,9 +550,6 @@ async function handleClassButton(interaction, which) {
 
 // ---- Slash command registration ----
 async function registerSlashCommands() {
-  // You MUST set guildId in config.json for instant updates:
-  // "guildId": "YOUR_SERVER_ID"
-  // If you don't set it, we fall back to global commands (can take ages to appear).
   const commands = [
     new SlashCommandBuilder().setName("refresh").setDescription("Force a standings refresh now"),
   ].map((c) => c.toJSON());
@@ -620,12 +571,11 @@ let lastRefreshAt = 0;
 const REFRESH_COOLDOWN_MS = 30_000;
 
 async function handleRefreshCommand(interaction) {
-  // ACK once
   await interaction.deferReply({ ephemeral: true });
 
-  const now = Date.now();
-  if (now - lastRefreshAt < REFRESH_COOLDOWN_MS) {
-    const wait = Math.ceil((REFRESH_COOLDOWN_MS - (now - lastRefreshAt)) / 1000);
+  const nowMs = Date.now();
+  if (nowMs - lastRefreshAt < REFRESH_COOLDOWN_MS) {
+    const wait = Math.ceil((REFRESH_COOLDOWN_MS - (nowMs - lastRefreshAt)) / 1000);
     await interaction.editReply(`Please wait ${wait}s before refreshing again.`);
     autoDeleteEphemeral(interaction, 10000);
     return;
@@ -638,17 +588,21 @@ async function handleRefreshCommand(interaction) {
   }
 
   refreshLock = true;
-  lastRefreshAt = now;
+  lastRefreshAt = nowMs;
 
   try {
     const channel = await client.channels.fetch(config.channelId);
     if (!channel || !channel.isTextBased()) throw new Error("Configured channelId is not a text channel");
 
-    const stamp = discordTimestamp(new Date(), "F");
+    const nowDate = new Date();
     const { club50, yellow, red } = await scrapeAll();
-    await renderAndPostToMainMessage(channel, club50, yellow, red, stamp);
 
-    await interaction.editReply("✅ Refreshed and updated the standings message.");
+    // Manual refresh still follows the same rules:
+    // - lastChecked updates to now
+    // - lastUpdated updates ONLY if data changed
+    await applyUpdate(channel, club50, yellow, red, nowDate);
+
+    await interaction.editReply("✅ Refreshed and updated the standings message (if data changed).");
     autoDeleteEphemeral(interaction, 10000);
   } catch (e) {
     await interaction.editReply(`❌ Refresh failed: ${e?.message || e}`);
@@ -662,7 +616,6 @@ async function handleRefreshCommand(interaction) {
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Register slash commands after login (so client.user.id exists)
   try {
     await registerSlashCommands();
   } catch (e) {
@@ -678,7 +631,6 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Buttons
     if (interaction.isButton()) {
       await safeAck(interaction);
 
@@ -697,14 +649,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Slash commands
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "refresh") {
         await handleRefreshCommand(interaction);
       }
     }
   } catch (e) {
-    // best-effort fail-safe
     try {
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: true });
