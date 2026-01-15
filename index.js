@@ -644,7 +644,7 @@ async function handleRefreshCommand(interaction) {
     const channel = await client.channels.fetch(config.channelId);
     if (!channel || !channel.isTextBased()) throw new Error("Configured channelId is not a text channel");
 
-    const stamp = formatLocalTime(new Date());
+    const stamp = discordTimestamp(new Date(), "F");
     const { club50, yellow, red } = await scrapeAll();
     await renderAndPostToMainMessage(channel, club50, yellow, red, stamp);
 
