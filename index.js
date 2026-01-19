@@ -45,6 +45,24 @@ const configPath = path.join(__dirname, "config.json");
 const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 const DEBUG_OOR = process.env.DEBUG_OOR === "1";
 
+// ------------------ button spam protection (v2.0+) ------------------
+// Per-user, per-button cooldown. Set to 5 minutes to match render auto-delete.
+const BUTTON_COOLDOWN_MS = 5 * 60 * 1000;
+const buttonCooldowns = new Map(); // key: `${userId}:${buttonId}` -> last timestamp (ms)
+
+function getButtonCooldownSeconds(userId, buttonId) {
+  const key = `${userId}:${buttonId}`;
+  const now = Date.now();
+  const last = buttonCooldowns.get(key) || 0;
+
+  if (now - last < BUTTON_COOLDOWN_MS) {
+    return Math.ceil((BUTTON_COOLDOWN_MS - (now - last)) / 1000);
+  }
+
+  buttonCooldowns.set(key, now);
+  return 0;
+}
+
 // ------------------ Sprint penalty sheet (v1.044+) ------------------
 // Public Google Sheet with two tabs: Split Yellow / Split Red
 // We scrape three columns and attach to Sprint standings rows:
@@ -1140,6 +1158,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // Buttons
     if (interaction.isButton()) {
       await safeAck(interaction);
+
+      // ---- cooldown: stop command button spam (per-user, per-button) ----
+      const wait = getButtonCooldownSeconds(interaction.user.id, interaction.customId);
+      if (wait > 0) {
+        await interaction.editReply(`⏳ Please wait ${wait}s before using this button again.`);
+        autoDeleteEphemeral(interaction, 5000);
+        return;
+      }
 
       if (interaction.customId === "oor_class_yellow") {
         await handleClassButton(interaction, "yellow");
