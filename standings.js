@@ -256,7 +256,212 @@ async function fetchSprintStandings(url) {
   return fetchStandingsGeneric(url, "SprintYellow");
 }
 
+
+// ------------------------------
+// Shared HTML fetch helper (used by SimGrid parsing)
+// ------------------------------
+async function fetchHtml(url, { attempts = 3, timeoutMs = 30000 } = {}) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "en-US,en;q=0.9",
+          "cache-control": "no-cache",
+          "pragma": "no-cache",
+          "referer": "https://www.thesimgrid.com/",
+        },
+      });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      return await res.text();
+    } catch (err) {
+      lastErr = err;
+      // small backoff
+      await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  throw lastErr || new Error("fetchHtml failed");
+}
+
+function flagEmojiToTwemojiPng(flagEmoji) {
+  if (!flagEmoji) return "";
+  // Twemoji uses lowercase hex codepoints joined by '-'
+  const code = Array.from(flagEmoji)
+    .map((ch) => ch.codePointAt(0).toString(16))
+    .join("-")
+    .toLowerCase();
+  return `https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/${code}.png`;
+}
+
+// ------------------------------
+// SimGrid standings
+// ------------------------------
+
+function cleanText(t) {
+  return (t || "")
+    .replace(/\s+/g, " ")
+    .replace(/\u00a0/g, " ")
+    .trim();
+}
+
+function simgridMakeKeyFromText(t) {
+  const s = cleanText(t).toLowerCase();
+  if (!s) return "";
+
+  const has = (k) => s.includes(k);
+
+  // Hypercar / LMGT3 common makes
+  if (has("mclaren")) return "mclaren";
+  if (has("toyota") || has("gazoo")) return "toyota_gazoo";
+  if (has("ferrari")) return "ferrari";
+  if (has("porsche")) return "porsche";
+  if (has("bmw")) return "bmw";
+  if (has("mercedes") || has("amg")) return "mercedes";
+  if (has("cadillac")) return "cadillac";
+  if (has("peugeot")) return "peugeot";
+  if (has("alpine")) return "alpine";
+  if (has("lamborghini")) return "lamborghini";
+  if (has("aston")) return "astonmartin";
+  if (has("lexus")) return "lexus";
+  if (has("honda") || has("acura")) return "honda";
+  if (has("chevrolet") || has("corvette")) return "corvette";
+
+  return "";
+}
+
+function simgridMakeKeyFromSrc(src) {
+  const u = String(src || "").toLowerCase();
+  if (!u) return "";
+
+  // Some CDNs put the make in the filename/path
+  if (u.includes("mclaren")) return "mclaren";
+  if (u.includes("toyota")) return "toyota_gazoo";
+  if (u.includes("gazoo")) return "toyota_gazoo";
+  if (u.includes("ferrari")) return "ferrari";
+  if (u.includes("porsche")) return "porsche";
+  if (u.includes("bmw")) return "bmw";
+  if (u.includes("mercedes") || u.includes("amg")) return "mercedes";
+  if (u.includes("cadillac")) return "cadillac";
+  if (u.includes("peugeot")) return "peugeot";
+  if (u.includes("alpine")) return "alpine";
+  if (u.includes("lamborghini")) return "lamborghini";
+  if (u.includes("aston")) return "astonmartin";
+  if (u.includes("lexus")) return "lexus";
+  if (u.includes("honda") || u.includes("acura")) return "honda";
+  if (u.includes("chevrolet") || u.includes("corvette")) return "corvette";
+
+  return "";
+}
+
+/**
+ * Fetch and parse a SimGrid standings table.
+ * Returns rows compatible with render.js (pos, driver, carNo, className, carImg, countryImg, total, etc.).
+ */
+async function fetchSimgridStandings(url, label = "SimGrid") {
+  const DEBUG_OOR_SIMGRID = process.env.DEBUG_OOR === "1";
+  const html = await fetchHtml(url);
+  const $ = cheerio.load(html);
+
+  const table = $("table.table-results");
+  if (!table.length) {
+    throw new Error(`${label}: standings table not found`);
+  }
+
+  const rows = [];
+  table.find("tbody tr").each((_, tr) => {
+    const $tr = $(tr);
+
+    // Position
+    const pos =
+      cleanText($tr.find("td.result-position strong").first().text()) ||
+      cleanText($tr.find("td").first().text());
+
+    // Driver name (sometimes includes a leading flag emoji). SimGrid also appends a rating like "Name 2,202".
+    const driverTextRaw = cleanText($tr.find("a.entrant-name").first().text());
+    const flagMatch = driverTextRaw.match(/^([\p{Regional_Indicator}]{2})\s+/u);
+    const flagEmoji = flagMatch ? flagMatch[1] : "";
+    let driverText = flagMatch ? driverTextRaw.slice(flagMatch[0].length).trim() : driverTextRaw;
+
+    let rating = "";
+    const ratingMatch = driverText.match(/\s(\d{1,3}(?:,\d{3})+)\s*$/);
+    if (ratingMatch) {
+      rating = ratingMatch[1];
+      driverText = driverText.slice(0, ratingMatch.index).trim();
+    }
+
+    const driver = driverText;
+    const countryImg = flagEmoji ? flagEmojiToTwemojiPng(flagEmoji) : "";
+
+    // Car number
+    const carNo = cleanText($tr.find("span.badge-number-board .car-number").first().text());
+
+    // Vehicle icon + manufacturer hint
+    const $carCell = $tr.find("td.nowrap").first();
+    const $carImg = $carCell.find("img").first();
+
+    // Icon
+    let carImg = $carImg.attr("src") || "";
+    if (carImg && carImg.startsWith("/")) {
+      carImg = `https://www.thesimgrid.com${carImg}`;
+    }
+
+    // Make key detection: prefer alt/title/tooltip text; fall back to src
+    const hint =
+      cleanText($carImg.attr("alt")) ||
+      cleanText($carImg.attr("title")) ||
+      cleanText($carImg.attr("data-bs-original-title")) ||
+      cleanText($carCell.attr("title")) ||
+      cleanText($carCell.text());
+
+    const carMakeKey = simgridMakeKeyFromText(hint) || simgridMakeKeyFromSrc(carImg);
+
+    // Points: the last td.fw-bold in the row
+    const pts = cleanText($tr.find("td.fw-bold").last().text()) || "0";
+
+    if (!driver) return; // skip empty rows
+
+    rows.push({
+      pos: pos || "",
+      driver,
+      rating,
+      carNo: carNo || "",
+      className: "",
+      carImg: carImg || "",
+      carMakeKey: carMakeKey || "",
+      countryImg,
+      racePts: "",
+      qualiPts: "",
+      flPts: "",
+      total: pts,
+      nett: pts,
+      diff: "",
+    });
+  });
+
+  if (DEBUG_OOR_SIMGRID) {
+    console.log("\n==============================");
+    console.log(`DEBUG_OOR: ${label}`);
+    console.log("Parsed rows:", rows.length);
+    console.log("Sample row:", rows[0]);
+  }
+
+  return { rows };
+}
+
 module.exports = {
+  fetchSimgridStandings,
   fetchClub50Standings,
   fetchSprintStandings
 };

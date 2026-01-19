@@ -1,4 +1,5 @@
 node_modules/
+Backups/
 config.json
 *.log
 .DS_Store
