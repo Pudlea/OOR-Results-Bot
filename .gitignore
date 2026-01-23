@@ -3,3 +3,4 @@ Backups/
 config.json
 *.log
 .DS_Store
+state.json

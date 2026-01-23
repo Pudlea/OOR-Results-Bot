@@ -756,10 +756,19 @@ if (split) {
             ctx.fillText(suffix, textX + baseW, midY);
           }
         } else {
+          // QB-active rows stay fully red; just include the penalty suffix text.
+          let displayName = name;
+
+          if (sprintSplit && qbActive) {
+            const parts = splitPenaltySuffix(name);
+            const dynSuffix = buildPenaltySuffixFromRow(r); // "(X - QB)" or ""
+            displayName = parts.base + (dynSuffix || parts.suffix);
+          }
+
           ctx.fillStyle = rowTextColor;
           ctx.textAlign = "left";
           ctx.textBaseline = "middle";
-          ctx.fillText(name, textX, midY);
+          ctx.fillText(displayName, textX, midY);
         }
       } else if (c.isIcon && c.key === "carImg") {
         const url = normalizeText(r.carImg);
